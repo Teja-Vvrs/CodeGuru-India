@@ -1,8 +1,12 @@
 """Explanation engine for generating code explanations with analogies."""
+import time
+import hashlib
 from dataclasses import dataclass
 from typing import List
 from ai.langchain_orchestrator import LangChainOrchestrator
+from utils.performance_metrics import record_metric
 import logging
+import streamlit as st
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,40 @@ class ExplanationEngine:
         """Initialize with LangChain orchestrator."""
         self.orchestrator = langchain_orchestrator
         self.framework_patterns = self._initialize_framework_patterns()
+        self._ensure_explanation_cache()
+    
+    def _ensure_explanation_cache(self):
+        """Ensure explanation cache exists in session state."""
+        if "explanation_cache" not in st.session_state:
+            st.session_state.explanation_cache = {}
+    
+    def _generate_explanation_hash(
+        self,
+        code: str,
+        context: str,
+        language: str,
+        difficulty: str
+    ) -> str:
+        """Generate hash for explanation request."""
+        content = f"{code}:{context}:{language}:{difficulty}"
+        return hashlib.sha256(content.encode()).hexdigest()
+    
+    def _get_cached_explanation(self, exp_hash: str):
+        """Get cached explanation if available."""
+        self._ensure_explanation_cache()
+        return st.session_state.explanation_cache.get(exp_hash)
+    
+    def _cache_explanation(self, exp_hash: str, explanation: Explanation) -> None:
+        """Cache explanation result."""
+        self._ensure_explanation_cache()
+        
+        # Limit cache size to 30 entries
+        if len(st.session_state.explanation_cache) >= 30:
+            # Remove oldest entry
+            oldest_key = next(iter(st.session_state.explanation_cache))
+            del st.session_state.explanation_cache[oldest_key]
+        
+        st.session_state.explanation_cache[exp_hash] = explanation
     
     def _initialize_framework_patterns(self) -> dict:
         """Initialize framework detection patterns and insights."""
@@ -201,7 +239,7 @@ class ExplanationEngine:
         difficulty: str = "intermediate"
     ) -> Explanation:
         """
-        Generate explanation for code snippet.
+        Generate explanation for code snippet with caching.
         
         Args:
             code: Code to explain
@@ -212,7 +250,24 @@ class ExplanationEngine:
         Returns:
             Complete explanation
         """
+        start_time = time.time()
+        
         try:
+            # Check cache
+            exp_hash = self._generate_explanation_hash(code, context, language, difficulty)
+            cached_explanation = self._get_cached_explanation(exp_hash)
+            
+            if cached_explanation is not None:
+                duration = time.time() - start_time
+                record_metric("explanation_cached", duration, {
+                    "cache_hit": True,
+                    "code_length": len(code),
+                    "language": language
+                })
+                logger.info(f"Cache hit for explanation - returned in {duration:.3f}s")
+                return cached_explanation
+            
+            # Cache miss - generate explanation
             # Detect frameworks
             frameworks = self.detect_frameworks(code)
             framework_insights = self.get_framework_insights(frameworks)
@@ -224,7 +279,7 @@ class ExplanationEngine:
                 for fw, insights in framework_insights.items():
                     enhanced_context += f"\n\n{fw.upper()} Context: {insights['indian_context']}"
             
-            # Generate main explanation
+            # Generate main explanation (uses LLM caching internally)
             explanation_text = self.orchestrator.explain_code(
                 code=code,
                 language=language,
@@ -260,15 +315,34 @@ class ExplanationEngine:
             # Create examples (simplified)
             examples = self._generate_examples(code)
             
-            return Explanation(
+            explanation = Explanation(
                 summary=explanation_text[:200] + "..." if len(explanation_text) > 200 else explanation_text,
                 detailed_explanation=explanation_text,
                 analogies=analogies[:3],  # Limit to 3 analogies
                 examples=examples,
                 key_concepts=key_concepts[:8]  # Limit to 8 concepts
             )
+            
+            # Cache the result
+            self._cache_explanation(exp_hash, explanation)
+            
+            # Record metrics
+            duration = time.time() - start_time
+            record_metric("explanation_generated", duration, {
+                "cache_hit": False,
+                "code_length": len(code),
+                "language": language,
+                "num_frameworks": len(frameworks)
+            })
+            
+            logger.info(f"Explanation generated in {duration:.3f}s")
+            return explanation
         
         except Exception as e:
+            duration = time.time() - start_time
+            record_metric("explanation_error", duration, {
+                "error": str(e)
+            })
             logger.error(f"Explanation generation failed: {e}")
             return self._get_fallback_explanation(code)
     

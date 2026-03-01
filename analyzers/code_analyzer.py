@@ -1,10 +1,14 @@
 """Code analyzer for parsing and analyzing code files."""
 import ast
 import re
+import time
+import hashlib
 from dataclasses import dataclass
 from typing import List, Optional
 from ai.langchain_orchestrator import LangChainOrchestrator
+from utils.performance_metrics import record_metric
 import logging
+import streamlit as st
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +73,34 @@ class CodeAnalyzer:
     def __init__(self, langchain_orchestrator: LangChainOrchestrator):
         """Initialize with LangChain orchestrator."""
         self.orchestrator = langchain_orchestrator
+        self._ensure_analysis_cache()
+    
+    def _ensure_analysis_cache(self):
+        """Ensure analysis cache exists in session state."""
+        if "code_analysis_cache" not in st.session_state:
+            st.session_state.code_analysis_cache = {}
+    
+    def _generate_code_hash(self, code: str, filename: str) -> str:
+        """Generate hash for code content."""
+        content = f"{filename}:{code}"
+        return hashlib.sha256(content.encode()).hexdigest()
+    
+    def _get_cached_analysis(self, code_hash: str) -> Optional[CodeAnalysis]:
+        """Get cached analysis if available."""
+        self._ensure_analysis_cache()
+        return st.session_state.code_analysis_cache.get(code_hash)
+    
+    def _cache_analysis(self, code_hash: str, analysis: CodeAnalysis) -> None:
+        """Cache analysis result."""
+        self._ensure_analysis_cache()
+        
+        # Limit cache size to 50 entries
+        if len(st.session_state.code_analysis_cache) >= 50:
+            # Remove oldest entry
+            oldest_key = next(iter(st.session_state.code_analysis_cache))
+            del st.session_state.code_analysis_cache[oldest_key]
+        
+        st.session_state.code_analysis_cache[code_hash] = analysis
     
     def analyze_file(
         self,
@@ -77,7 +109,7 @@ class CodeAnalyzer:
         language: str = "english"
     ) -> CodeAnalysis:
         """
-        Analyze a single code file.
+        Analyze a single code file with caching.
         
         Args:
             code: Source code content
@@ -87,6 +119,8 @@ class CodeAnalyzer:
         Returns:
             Complete code analysis
         """
+        start_time = time.time()
+        
         try:
             if not code:
                 return CodeAnalysis(
@@ -97,11 +131,25 @@ class CodeAnalyzer:
                     complexity_score=0
                 )
             
-            # Extract structure
+            # Check cache
+            code_hash = self._generate_code_hash(code, filename)
+            cached_analysis = self._get_cached_analysis(code_hash)
+            
+            if cached_analysis is not None:
+                duration = time.time() - start_time
+                record_metric("code_analysis_cached", duration, {
+                    "cache_hit": True,
+                    "filename": filename,
+                    "code_length": len(code)
+                })
+                logger.info(f"Cache hit for {filename} - returned in {duration:.3f}s")
+                return cached_analysis
+            
+            # Cache miss - perform analysis
             file_extension = filename.split('.')[-1] if '.' in filename else ''
             structure = self.extract_structure(code, file_extension)
             
-            # Generate summary using AI
+            # Generate summary using AI (with LLM caching)
             summary = self.orchestrator.summarize_code(code, language)
             
             # Identify patterns using AI
@@ -113,15 +161,37 @@ class CodeAnalyzer:
             # Calculate complexity (simple heuristic)
             complexity_score = self._calculate_complexity(code)
             
-            return CodeAnalysis(
+            analysis = CodeAnalysis(
                 summary=summary,
                 structure=structure,
                 patterns=patterns,
                 issues=issues,
                 complexity_score=complexity_score
             )
+            
+            # Cache the result
+            self._cache_analysis(code_hash, analysis)
+            
+            # Record metrics
+            duration = time.time() - start_time
+            record_metric("code_analysis", duration, {
+                "cache_hit": False,
+                "filename": filename,
+                "code_length": len(code),
+                "num_functions": len(structure.functions),
+                "num_classes": len(structure.classes),
+                "num_issues": len(issues)
+            })
+            
+            logger.info(f"Analysis completed for {filename} in {duration:.3f}s")
+            return analysis
         
         except Exception as e:
+            duration = time.time() - start_time
+            record_metric("code_analysis_error", duration, {
+                "error": str(e),
+                "filename": filename
+            })
             logger.error(f"Code analysis failed: {e}")
             # Return minimal analysis
             return CodeAnalysis(

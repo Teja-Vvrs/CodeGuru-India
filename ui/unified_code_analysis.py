@@ -15,6 +15,17 @@ from typing import Optional
 from ui.design_system import section_header, spacing, info_box, render_hero, render_soft_panel
 from ui.learning_artifacts_dashboard import render_learning_artifacts_dashboard
 from utils.performance_metrics import record_metric
+from utils.error_handler import (
+    display_error,
+    FileValidationError,
+    AnalysisError
+)
+from utils.security import (
+    validate_and_sanitize_file,
+    sanitize_user_input,
+    ensure_memory_only_processing,
+    SecurityAuditor
+)
 
 logger = logging.getLogger(__name__)
 
@@ -447,16 +458,82 @@ def _render_single_file_upload(session_manager, code_analyzer):
     )
     
     if uploaded_file:
+        # Validate file upload with comprehensive security checks
+        allowed_extensions = ['.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.c', '.go', '.rb']
+        is_valid, error_msg, warnings = validate_and_sanitize_file(
+            uploaded_file,
+            max_size_mb=10,
+            allowed_extensions=allowed_extensions
+        )
+        
+        if not is_valid:
+            display_error(
+                "File Upload Error",
+                error_msg,
+                suggestions=[
+                    "Check that your file is under 10MB",
+                    "Ensure the file has a supported extension",
+                    "Verify the file is not corrupted or contains malicious content",
+                    "Try a different file"
+                ]
+            )
+            return
+        
+        # Display security warnings if any
+        if warnings:
+            for warning in warnings:
+                st.warning(f"⚠️ Security Notice: {warning}")
+        
         file_signature = f"{uploaded_file.name}:{uploaded_file.size}"
         previous_signature = st.session_state.get("single_file_context_signature")
 
         if previous_signature != file_signature:
-            # Store uploaded file and create chat-compatible context for this exact file.
-            file_content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
-            session_manager.set_uploaded_code(file_content, uploaded_file.name)
-            _reset_chat_state_for_new_source()
-            _prepare_single_file_chat_context(session_manager, uploaded_file.name, file_content)
-            st.session_state.single_file_context_signature = file_signature
+            try:
+                # Store uploaded file and create chat-compatible context for this exact file.
+                file_content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
+                
+                # Sanitize code content
+                is_valid_code, error_msg, sanitized_code, code_warnings = sanitize_user_input(
+                    file_content,
+                    input_type='code',
+                    max_length=1000000  # 1MB text limit
+                )
+                
+                if not is_valid_code:
+                    st.error(error_msg)
+                    return
+                
+                # Display code warnings
+                if code_warnings:
+                    with st.expander("⚠️ Code Security Warnings"):
+                        for warning in code_warnings:
+                            st.warning(warning)
+                
+                # Ensure memory-only processing
+                if not ensure_memory_only_processing():
+                    st.error("Security validation failed: Code persistence detected")
+                    return
+                
+                session_manager.set_uploaded_code(sanitized_code, uploaded_file.name)
+                _reset_chat_state_for_new_source()
+                _prepare_single_file_chat_context(session_manager, uploaded_file.name, sanitized_code)
+                st.session_state.single_file_context_signature = file_signature
+                
+                # Audit memory usage
+                SecurityAuditor.audit_memory_usage()
+            
+            except Exception as e:
+                logger.error(f"File processing failed: {e}")
+                display_error(
+                    "File Processing Error",
+                    "Failed to process the uploaded file",
+                    suggestions=[
+                        "Check if the file is corrupted",
+                        "Try re-uploading the file",
+                        "Ensure the file contains valid code"
+                    ]
+                )
+                return
         
         st.success(f"✅ Uploaded: {uploaded_file.name}")
 
@@ -486,8 +563,31 @@ def _render_github_upload(repository_manager, session_manager):
         if not github_url:
             st.error("Please enter a GitHub URL")
         else:
+            # Sanitize and validate GitHub URL
+            is_valid, error_msg, sanitized_url, warnings = sanitize_user_input(
+                github_url,
+                input_type='url'
+            )
+            
+            if not is_valid:
+                display_error(
+                    "Invalid GitHub URL",
+                    error_msg,
+                    suggestions=[
+                        "Ensure the URL starts with https://",
+                        "Use the format: https://github.com/username/repository",
+                        "Check for typos in the URL"
+                    ]
+                )
+                return
+            
+            # Display warnings if any
+            if warnings:
+                for warning in warnings:
+                    st.warning(f"⚠️ {warning}")
+            
             with st.spinner("Cloning repository..."):
-                result = repository_manager.upload_from_github(github_url)
+                result = repository_manager.upload_from_github(sanitized_url)
                 
                 if result.success:
                     _clear_single_file_state(session_manager)
@@ -502,6 +602,14 @@ def _render_github_upload(repository_manager, session_manager):
                         source_ref=result.repo_path,
                         summary=getattr(result.repo_analysis, "summary", ""),
                     )
+                    
+                    # Ensure memory-only processing
+                    if not ensure_memory_only_processing():
+                        st.warning("⚠️ Security notice: Repository data is stored in temporary directory")
+                    
+                    # Audit memory usage
+                    SecurityAuditor.audit_memory_usage()
+                    
                     st.success(f"✅ Repository uploaded successfully!")
                     st.session_state.analysis_mode = 'deep'
                     st.session_state.workflow_step = 'analyze'

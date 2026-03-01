@@ -1,9 +1,12 @@
 """LangChain orchestration for LLM interactions."""
 import json
 import logging
+import time
 from typing import Dict, Optional
 from ai.bedrock_client import BedrockClient
 from ai.prompt_templates import PromptManager
+from utils.llm_cache import get_cache
+from utils.performance_metrics import record_metric
 
 logger = logging.getLogger(__name__)
 
@@ -11,10 +14,24 @@ logger = logging.getLogger(__name__)
 class LangChainOrchestrator:
     """Orchestrates LLM calls using LangChain and AWS Bedrock."""
     
-    def __init__(self, bedrock_client: BedrockClient, prompt_manager: PromptManager):
-        """Initialize with Bedrock client and prompt manager."""
+    def __init__(
+        self,
+        bedrock_client: BedrockClient,
+        prompt_manager: PromptManager,
+        enable_cache: bool = True
+    ):
+        """
+        Initialize with Bedrock client and prompt manager.
+        
+        Args:
+            bedrock_client: AWS Bedrock client
+            prompt_manager: Prompt template manager
+            enable_cache: Enable response caching (default: True)
+        """
         self.bedrock_client = bedrock_client
         self.prompt_manager = prompt_manager
+        self.enable_cache = enable_cache
+        self.cache = get_cache() if enable_cache else None
     
     def generate_completion(
         self,
@@ -23,7 +40,7 @@ class LangChainOrchestrator:
         temperature: float = 0.7
     ) -> str:
         """
-        Generate completion from LLM.
+        Generate completion from LLM with caching.
         
         Args:
             prompt: Input prompt
@@ -33,20 +50,52 @@ class LangChainOrchestrator:
         Returns:
             Generated text
         """
+        start_time = time.time()
+        
         try:
             parameters = {
                 "max_tokens": max_tokens,
                 "temperature": temperature
             }
             
+            # Check cache first
+            if self.enable_cache and self.cache:
+                cached_response = self.cache.get(prompt, parameters)
+                if cached_response is not None:
+                    duration = time.time() - start_time
+                    record_metric("llm_completion_cached", duration, {
+                        "cache_hit": True,
+                        "prompt_length": len(prompt)
+                    })
+                    logger.info(f"Cache hit - returned in {duration:.3f}s")
+                    return cached_response
+            
+            # Cache miss - call LLM
             response = self.bedrock_client.invoke_model(
                 prompt=prompt,
                 parameters=parameters
             )
             
+            # Store in cache
+            if self.enable_cache and self.cache:
+                self.cache.set(prompt, response, parameters)
+            
+            # Record metrics
+            duration = time.time() - start_time
+            record_metric("llm_completion", duration, {
+                "cache_hit": False,
+                "prompt_length": len(prompt),
+                "response_length": len(response) if response else 0
+            })
+            
+            logger.info(f"LLM completion generated in {duration:.3f}s")
             return response
         
         except Exception as e:
+            duration = time.time() - start_time
+            record_metric("llm_completion_error", duration, {
+                "error": str(e)
+            })
             logger.error(f"Completion generation failed: {e}")
             return f"Error generating response: {str(e)}"
     
