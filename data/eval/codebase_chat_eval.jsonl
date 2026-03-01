@@ -1,0 +1,8 @@
+{"id":"routing_impl","question":"which file handles semantic code search and retrieval scoring?","expected_files":["analyzers/semantic_code_search.py"]}
+{"id":"intent_split","question":"where is multi intent query decomposition implemented?","expected_files":["analyzers/multi_intent_analyzer.py"]}
+{"id":"rag_engine","question":"where is the rag explanation generation logic?","expected_files":["analyzers/rag_explainer.py"]}
+{"id":"chat_ui","question":"which file renders the codebase chat page?","expected_files":["ui/codebase_chat.py"]}
+{"id":"repo_scan","question":"where does the repository analyzer collect file tree and language stats?","expected_files":["analyzers/repo_analyzer.py"]}
+{"id":"repo_upload","question":"where is folder/github upload flow implemented?","expected_files":["analyzers/repository_manager.py"]}
+{"id":"session_state","question":"where is current repository stored in session state?","expected_files":["session_manager.py"]}
+{"id":"metrics","question":"which file records performance metrics for chat operations?","expected_files":["utils/performance_metrics.py"]}

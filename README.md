@@ -235,6 +235,36 @@ pytest -v
 pytest tests/integration/test_end_to_end_flow.py
 ```
 
+Run extreme retrieval benchmark (100+ prompts):
+
+```bash
+# Regenerate benchmark prompt pack (120 cases)
+PYTHONPATH=. python utils/generate_benchmark_pack.py \
+  --output data/eval/codebase_chat_benchmark_120.jsonl \
+  --cases-per-target 10
+
+# Run benchmark with baseline quality gates (fails with non-zero exit if gate fails)
+PYTHONPATH=. python utils/codebase_chat_eval.py \
+  --repo-path /Users/charan/Desktop/pro \
+  --dataset data/eval/codebase_chat_benchmark_120.jsonl \
+  --top-k 5 \
+  --gate-profile baseline \
+  --fail-on-gate
+
+# Run stricter gate profile for production hardening
+PYTHONPATH=. python utils/codebase_chat_eval.py \
+  --repo-path /Users/charan/Desktop/pro \
+  --dataset data/eval/codebase_chat_benchmark_120.jsonl \
+  --top-k 5 \
+  --gate-profile production \
+  --fail-on-gate
+```
+
+Gate profiles available in the evaluator:
+- `baseline` (current system stability target)
+- `production` (higher quality bar)
+- `strict` (hard red-team bar)
+
 Test coverage includes:
 - End-to-end workflow tests
 - AI integration tests

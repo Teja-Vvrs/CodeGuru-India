@@ -37,6 +37,10 @@ class RAGExplainer:
         "defined in",
         "implemented in",
         "located",
+        "is there",
+        "does",
+        "exist",
+        "file exists",
     )
     NOISE_FILE_HINTS = (
         ".env",
@@ -220,6 +224,7 @@ class RAGExplainer:
         repo_context: Any,
         use_web_search: bool = True,
         output_language: str = "english",
+        response_profile: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
         Generate detailed ChatGPT-style explanation for intent.
@@ -246,6 +251,30 @@ class RAGExplainer:
                     scoped_chunks = relevant_chunks
 
             requested_file_targets = self._extract_requested_file_targets(intent)
+            if requested_file_targets and self._is_file_existence_intent(intent):
+                matched_files = self._find_matching_files_in_repo_context(
+                    repo_context,
+                    requested_file_targets,
+                )
+                return {
+                    'intent': intent,
+                    'explanation': self._file_existence_response(
+                        output_language,
+                        requested_file_targets,
+                        matched_files,
+                    ),
+                    'code_references': [
+                        {
+                            'file': file_path,
+                            'lines': "",
+                            'content': "",
+                        }
+                        for file_path in matched_files[:5]
+                    ],
+                    'external_sources': False,
+                    'confidence': 'high',
+                }
+
             if is_location_query and requested_file_targets:
                 matched_chunks = self._filter_chunks_by_requested_targets(scoped_chunks, requested_file_targets)
                 if not matched_chunks:
@@ -296,6 +325,7 @@ class RAGExplainer:
                         grounded_snippets,
                         observed_facts,
                         output_language=output_language,
+                        response_profile=response_profile,
                     )
             else:
                 explanation = self._generate_explanation(
@@ -306,6 +336,7 @@ class RAGExplainer:
                     grounded_snippets,
                     observed_facts,
                     output_language=output_language,
+                    response_profile=response_profile,
                 )
 
             explanation = self._strip_code_blocks(explanation)
@@ -320,13 +351,12 @@ class RAGExplainer:
                 intent,
                 output_language,
             )
-            evidence_section = self._format_evidence_section(
-                grounded_snippets,
-                output_language,
-                compact=is_feature_overview,
+            explanation = self._sanitize_final_answer_text(explanation, output_language)
+            explanation = self._compact_answer_with_relevant_files(
+                explanation=explanation,
+                chunks=scoped_chunks,
+                output_language=output_language,
             )
-            if evidence_section:
-                explanation = f"{explanation.strip()}\n\n{evidence_section}".strip()
             
             return {
                 'intent': intent,
@@ -366,7 +396,7 @@ class RAGExplainer:
             return []
 
         pattern = re.compile(
-            r"[A-Za-z0-9_./-]+\.(?:py|js|jsx|ts|tsx|java|go|rb|php|cs|json|yaml|yml|toml)",
+            r"[A-Za-z0-9_./-]+\.(?:jsx|tsx|py|js|ts|java|go|rb|php|cs|json|yaml|yml|toml)",
             flags=re.IGNORECASE,
         )
         targets: List[str] = []
@@ -378,6 +408,96 @@ class RAGExplainer:
             seen.add(normalized)
             targets.append(normalized)
         return targets
+
+    def _is_file_existence_intent(self, intent: str) -> bool:
+        """Detect explicit file existence checks like 'is there X.js'."""
+        query = (intent or "").strip().lower()
+        if not query:
+            return False
+        patterns = (
+            r"\bis there\b",
+            r"\bdoes\b.*\bexist\b",
+            r"\bfile exists\b",
+            r"\bexists\b",
+            r"\bdo we have\b",
+            r"\bis .* present\b",
+        )
+        return any(re.search(pattern, query) for pattern in patterns)
+
+    def _find_matching_files_in_repo_context(self, repo_context: Any, targets: List[str]) -> List[str]:
+        """Find exact or suffix path matches for requested targets in full repo file tree."""
+        if not repo_context or not hasattr(repo_context, "file_tree"):
+            return []
+
+        all_paths: List[str] = []
+        for files in getattr(repo_context, "file_tree", {}).values():
+            for file_info in files:
+                path = getattr(file_info, "path", "")
+                if path:
+                    all_paths.append(path)
+
+        normalized_paths = [(path, path.lower().replace("\\", "/")) for path in all_paths]
+        matched: List[str] = []
+        seen = set()
+
+        for target in targets:
+            normalized_target = target.lower().replace("\\", "/")
+            target_basename = normalized_target.split("/")[-1]
+            for original, normalized in normalized_paths:
+                if (
+                    normalized == normalized_target
+                    or normalized.endswith(f"/{normalized_target}")
+                    or normalized.endswith(f"/{target_basename}")
+                    or normalized_target in normalized
+                ):
+                    if original not in seen:
+                        seen.add(original)
+                        matched.append(original)
+
+        return matched
+
+    def _file_existence_response(
+        self,
+        output_language: str,
+        targets: List[str],
+        matched_files: List[str],
+    ) -> str:
+        """Localized yes/no response for explicit file existence queries."""
+        target_text = ", ".join(f"`{item}`" for item in targets[:4])
+        if matched_files:
+            matched_text = "\n".join(f"- `{path}`" for path in matched_files[:8])
+            if output_language == "hindi":
+                return (
+                    f"हाँ, रिपॉजिटरी में {target_text} के लिए मैच मिला।\n\n"
+                    "मिले हुए पाथ:\n"
+                    f"{matched_text}"
+                )
+            if output_language == "telugu":
+                return (
+                    f"అవును, repositoryలో {target_text} కు match దొరికింది.\n\n"
+                    "కనిపించిన paths:\n"
+                    f"{matched_text}"
+                )
+            return (
+                f"Yes, I found a match for {target_text} in this repository.\n\n"
+                "Matched path(s):\n"
+                f"{matched_text}"
+            )
+
+        if output_language == "hindi":
+            return (
+                f"नहीं, मुझे इस रिपॉजिटरी में {target_text} नहीं मिला।\n\n"
+                "संभव है फाइल का नाम/पाथ अलग हो। exact path देकर दोबारा पूछें।"
+            )
+        if output_language == "telugu":
+            return (
+                f"లేదు, ఈ repositoryలో {target_text} కనిపించలేదు.\n\n"
+                "ఫైల్ పేరు/పాత్ వేరుగా ఉండొచ్చు. exact path తో మళ్లీ అడగండి."
+            )
+        return (
+            f"No, I could not find {target_text} in this repository.\n\n"
+            "The file may use a different name/path. Ask again with exact path if needed."
+        )
 
     def _filter_chunks_by_requested_targets(
         self,
@@ -406,19 +526,10 @@ class RAGExplainer:
         target_text = ", ".join(f"`{item}`" for item in targets[:4])
 
         if output_language == "hindi":
-            return (
-                f"मुझे रिपॉजिटरी के रिट्रीव्ड snippets में {target_text} नहीं मिला।\n\n"
-                "संभव है यह फाइल मौजूद न हो या नाम अलग हो। कृपया exact path या संबंधित feature/module नाम से पूछें।"
-            )
+            return f"{target_text} नहीं मिला।"
         if output_language == "telugu":
-            return (
-                f"రిట్రీవ్ చేసిన repository snippets‌లో {target_text} కనపడలేదు.\n\n"
-                "ఈ ఫైల్ లేకపోవచ్చు లేదా పేరు వేరుగా ఉండొచ్చు. దయచేసి exact path లేదా సంబంధిత feature/module పేరుతో అడగండి."
-            )
-        return (
-            f"I could not find {target_text} in the retrieved repository snippets.\n\n"
-            "The file may not exist or may use a different name/path. Try with the exact path or related feature/module name."
-        )
+            return f"{target_text} కనిపించలేదు."
+        return f"{target_text} not found."
     
     def _analyze_code_chunks(self, chunks: List[CodeChunk]) -> Dict[str, Any]:
         """
@@ -555,6 +666,7 @@ Analysis:"""
         grounded_snippets: List[Dict[str, Any]],
         observed_facts: List[str],
         output_language: str = "english",
+        response_profile: Dict[str, Any] | None = None,
     ) -> str:
         """
         Generate comprehensive explanation.
@@ -606,6 +718,34 @@ Analysis:"""
                 "telugu": "Telugu",
             }.get(output_language, "English")
             
+            profile = response_profile or {}
+            depth = str(profile.get("depth", "standard")).lower()
+            format_pref = str(profile.get("format", "narrative")).lower()
+            include_examples = bool(profile.get("include_examples", False))
+
+            if depth == "brief":
+                sentence_rule = "2-4 short sentences."
+                max_tokens = 450
+            elif depth == "deep":
+                sentence_rule = "6-12 sentences."
+                max_tokens = 1050
+            else:
+                sentence_rule = "4-8 sentences."
+                max_tokens = 700
+
+            if format_pref == "steps":
+                structure_rule = "Use a numbered step-by-step structure."
+            elif format_pref == "bullets":
+                structure_rule = "Use concise bullet points."
+            else:
+                structure_rule = "Use a natural explanatory paragraph style."
+
+            example_rule = (
+                "Include a tiny evidence-grounded example only when directly asked."
+                if include_examples else
+                "Do not add examples unless the user explicitly asked for them."
+            )
+
             # Generate explanation
             prompt = f"""You are an expert code explainer. Provide a detailed and accurate explanation.
 
@@ -622,13 +762,14 @@ Strict grounding rules (must follow):
 5. Prefer file-path and line references over hypothetical examples.
 6. Wrap every code entity (file path, route path, function/class/component/hook/API name) in backticks.
 
-Provide an explanation that:
-1. Directly answers the user's question
-2. Explains HOW it's implemented in this codebase
-3. Explains WHY this approach is used
-4. Explains relevant concepts/patterns grounded in evidence
-5. Mentions alternatives only as brief comparison without writing alternative code
-6. Add one concise culturally relevant Indian analogy (chai stall/cricket/railways/etc.) only if it helps understanding
+Output format requirements (strict):
+1. Answer only the asked question.
+2. Keep it concise ({sentence_rule})
+3. No section headings like "Direct Answer", "Implementation", "Alternative", "Cultural Relevance", "Evidence".
+4. Do not include generic extra topics not requested.
+5. If evidence is insufficient, answer exactly: "Not found in repository."
+6. {structure_rule}
+7. {example_rule}
 
 Output language requirement:
 - Write the explanation in {language_name}
@@ -638,7 +779,7 @@ Be clear and educational. Use markdown formatting.
 
 Explanation:"""
             
-            explanation = self.orchestrator.generate_completion(prompt, max_tokens=1500)
+            explanation = self.orchestrator.generate_completion(prompt, max_tokens=max_tokens)
             
             return explanation.strip()
         
@@ -759,24 +900,18 @@ Explanation:"""
             "node", "api", "http", "css", "html",
         })
 
-        removed_any = False
         cleaned_lines: List[str] = []
 
         for line in explanation.splitlines():
             if self._line_has_unsupported_backtick_token(line, supported_tokens):
-                removed_any = True
                 continue
             if self._line_has_unsupported_path(line, supported_paths, supported_basenames):
-                removed_any = True
                 continue
             cleaned_lines.append(line)
 
         cleaned = "\n".join(cleaned_lines).strip()
         if not cleaned:
             cleaned = self._not_found_message(output_language)
-
-        if removed_any:
-            cleaned = f"{cleaned}\n\n{self._unsupported_filtered_note(output_language)}".strip()
 
         return cleaned
 
@@ -790,27 +925,31 @@ Explanation:"""
         basenames: set[str] = set()
 
         identifier_pattern = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b")
-        file_pattern = re.compile(r"[A-Za-z0-9_./-]+\.(?:py|js|jsx|ts|tsx|java|go|rb|php|cs|json|yaml|yml|toml)")
+        file_pattern = re.compile(r"[A-Za-z0-9_./-]+\.(?:jsx|tsx|py|js|ts|java|go|rb|php|cs|json|yaml|yml|toml)")
 
         for snippet in grounded_snippets:
             file_path = (snippet.get("file_path") or "").strip()
             if file_path:
-                paths.add(file_path)
-                basenames.add(file_path.split("/")[-1])
-                tokens.add(file_path)
-                tokens.add(file_path.split("/")[-1])
+                lowered_path = file_path.lower()
+                lowered_basename = file_path.split("/")[-1].lower()
+                paths.add(lowered_path)
+                basenames.add(lowered_basename)
+                tokens.add(lowered_path)
+                tokens.add(lowered_basename)
 
             snippet_text = snippet.get("snippet") or ""
             for identifier in identifier_pattern.findall(snippet_text):
                 if self._looks_like_code_entity(identifier):
-                    tokens.add(identifier)
+                    tokens.add(identifier.lower())
             for path in file_pattern.findall(snippet_text):
                 normalized = path.strip("`'\" ")
                 if normalized:
-                    paths.add(normalized)
-                    basenames.add(normalized.split("/")[-1])
-                    tokens.add(normalized)
-                    tokens.add(normalized.split("/")[-1])
+                    lowered_path = normalized.lower()
+                    lowered_basename = normalized.split("/")[-1].lower()
+                    paths.add(lowered_path)
+                    basenames.add(lowered_basename)
+                    tokens.add(lowered_path)
+                    tokens.add(lowered_basename)
             for route_path in self._extract_route_examples(snippet_text):
                 tokens.add(route_path)
 
@@ -850,7 +989,7 @@ Explanation:"""
         supported_basenames: set[str],
     ) -> bool:
         """Check for plain-text file path mentions not present in evidence."""
-        file_pattern = re.compile(r"[A-Za-z0-9_./-]+\.(?:py|js|jsx|ts|tsx|java|go|rb|php|cs|json|yaml|yml|toml)")
+        file_pattern = re.compile(r"[A-Za-z0-9_./-]+\.(?:jsx|tsx|py|js|ts|java|go|rb|php|cs|json|yaml|yml|toml)")
         for path in file_pattern.findall(line):
             normalized = path.strip("`'\".,:;()[]{}").lower()
             if not normalized:
@@ -878,50 +1017,224 @@ Explanation:"""
     def _not_found_message(self, output_language: str) -> str:
         """Localized fallback when all unsupported lines are removed."""
         if output_language == "hindi":
-            return "रिट्रीव किए गए स्निपेट्स में इस प्रश्न का ठोस प्रमाण नहीं मिला।"
+            return "रिपॉजिटरी में नहीं मिला।"
         if output_language == "telugu":
-            return "రిట్రీవ్ చేసిన స్నిప్పెట్లలో ఈ ప్రశ్నకు సరిపడే స్పష్టమైన ఆధారాలు కనిపించలేదు."
-        return "I could not verify this answer from the retrieved snippets."
+            return "రిపోజిటరీలో కనపడలేదు."
+        return "Not found in repository."
 
-    def _unsupported_filtered_note(self, output_language: str) -> str:
-        """Localized note for filtered unsupported claims."""
-        if output_language == "hindi":
-            return "_नोट: जिन कोड entities का प्रमाण स्निपेट्स में नहीं मिला, उन्हें उत्तर से हटाया गया है।_"
-        if output_language == "telugu":
-            return "_గమనిక: రిట్రీవ్ చేసిన స్నిప్పెట్లలో ఆధారం లేని కోడ్ entities ను సమాధానం నుండి తొలగించాం._"
-        return "_Note: Unsupported code entities not present in retrieved snippets were removed._"
-
-    def _format_evidence_section(
+    def _compact_answer_with_relevant_files(
         self,
-        grounded_snippets: List[Dict[str, Any]],
+        explanation: str,
+        chunks: List[CodeChunk],
         output_language: str,
-        compact: bool = False,
     ) -> str:
-        """Append an explicit evidence section from actual retrieved snippets."""
-        if not grounded_snippets:
+        """Force concise output: direct answer + relevant files only."""
+        cleaned = self._strip_forced_sections(explanation or "")
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+        if not cleaned:
+            cleaned = self._not_found_message(output_language)
+
+        files = []
+        seen = set()
+        for chunk in chunks:
+            file_path = (chunk.file_path or "").strip()
+            if not file_path:
+                continue
+            if file_path in seen:
+                continue
+            seen.add(file_path)
+            files.append(file_path)
+            if len(files) >= 5:
+                break
+
+        if output_language == "hindi":
+            if files:
+                refs = ", ".join(f"`{path}`" for path in files)
+                return f"{cleaned}\n\nसंबंधित फाइलें: {refs}"
+            return f"{cleaned}\n\nसंबंधित फाइलें: नहीं मिलीं।"
+
+        if output_language == "telugu":
+            if files:
+                refs = ", ".join(f"`{path}`" for path in files)
+                return f"{cleaned}\n\nసంబంధిత ఫైళ్లు: {refs}"
+            return f"{cleaned}\n\nసంబంధిత ఫైళ్లు: లభించలేదు."
+
+        if files:
+            refs = ", ".join(f"`{path}`" for path in files)
+            return f"{cleaned}\n\nRelevant files: {refs}"
+        return f"{cleaned}\n\nRelevant files: not found."
+
+    def _sanitize_final_answer_text(self, text: str, output_language: str) -> str:
+        """Strip meta chatter and collapse duplicate content in model output."""
+        if not text:
+            return self._not_found_message(output_language)
+
+        compact = self._strip_forced_sections(text)
+        if not compact:
+            return self._not_found_message(output_language)
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", compact) if p.strip()]
+        if not paragraphs:
+            return self._not_found_message(output_language)
+
+        kept_paragraphs: List[str] = []
+        seen_paragraphs: set[str] = set()
+
+        for paragraph in paragraphs:
+            if self._is_meta_chatter_paragraph(paragraph):
+                continue
+
+            deduped = self._dedupe_lines_and_sentences(paragraph)
+            if not deduped:
+                continue
+
+            signature = self._normalize_for_signature(deduped)
+            if not signature:
+                continue
+            if signature in seen_paragraphs:
+                continue
+            seen_paragraphs.add(signature)
+            kept_paragraphs.append(deduped)
+
+        cleaned = "\n\n".join(kept_paragraphs).strip()
+        if not cleaned:
+            return self._not_found_message(output_language)
+        return cleaned
+
+    def _is_meta_chatter_paragraph(self, paragraph: str) -> bool:
+        """Detect and remove procedural/self-rewrite model chatter."""
+        if not paragraph:
+            return False
+
+        normalized = paragraph.lower()
+        markers = (
+            "revised answer",
+            "strict requirements",
+            "i'll be happy to help",
+            "i will be happy to help",
+            "can you please narrow down",
+            "provided context includes",
+            "please note that i couldn't find",
+            "please note that i could not find",
+            "in my next answer",
+            "let me provide a revised answer",
+            "let me know if i can assist",
+            "the snippets below are directly taken",
+            "unsupported code entities not present in retrieved snippets were removed",
+            "evidence from repository",
+            "here's the revised answer",
+            "here is the revised answer",
+            "however, if you're looking for a similar concept",
+            "however, if you are looking for a similar concept",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _dedupe_lines_and_sentences(self, paragraph: str) -> str:
+        """Remove repeated lines/sentences while preserving meaningful structure."""
+        if not paragraph:
             return ""
 
-        if output_language == "hindi":
-            header = "### रिपॉजिटरी से प्रमाण (Retrieved Snippets)"
-            note = "नीचे दिए गए snippets सीधे रिपॉजिटरी से लिए गए हैं:"
-        elif output_language == "telugu":
-            header = "### రిపోజిటరీ ఆధారాలు (Retrieved Snippets)"
-            note = "క్రింద snippets నేరుగా రిపోజిటరీ నుంచి తీసుకున్నవి:"
-        else:
-            header = "### Evidence From Repository (Retrieved Snippets)"
-            note = "The snippets below are directly taken from retrieved repository chunks:"
+        lines = [line.rstrip() for line in paragraph.splitlines() if line.strip()]
+        unique_lines: List[str] = []
+        seen_lines: set[str] = set()
+        for line in lines:
+            signature = self._normalize_for_signature(line)
+            if not signature or signature in seen_lines:
+                continue
+            seen_lines.add(signature)
+            unique_lines.append(line)
 
-        lines = [header, note]
-        for idx, snippet in enumerate(grounded_snippets[:4], start=1):
-            lines.append(
-                f"- Snippet {idx}: `{snippet['file_path']}` (lines {snippet['start_line']}-{snippet['end_line']})"
-            )
-            if not compact:
-                lines.append("```")
-                lines.append(snippet["snippet"].strip())
-                lines.append("```")
+        if not unique_lines:
+            return ""
 
-        return "\n".join(lines)
+        one_line = " ".join(unique_lines).strip()
+        sentence_parts = re.split(r"(?<=[.!?])\s+", one_line)
+        unique_sentences: List[str] = []
+        seen_sentences: set[str] = set()
+        for sentence in sentence_parts:
+            cleaned = sentence.strip()
+            if not cleaned:
+                continue
+            signature = self._normalize_for_signature(cleaned)
+            if not signature or signature in seen_sentences:
+                continue
+            seen_sentences.add(signature)
+            unique_sentences.append(cleaned)
+
+        if unique_sentences:
+            return " ".join(unique_sentences).strip()
+        return "\n".join(unique_lines).strip()
+
+    def _normalize_for_signature(self, text: str) -> str:
+        """Normalize text to detect semantic duplicates robustly."""
+        cleaned = re.sub(r"`[^`]*`", "`code`", text or "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+        cleaned = re.sub(r"[^a-z0-9 ]+", "", cleaned)
+        return cleaned
+
+    def _strip_forced_sections(self, text: str) -> str:
+        """Remove template headings and verbose boilerplate sections."""
+        if not text:
+            return ""
+
+        blocked_heading_patterns = [
+            r"^\s*#+\s*direct answer\s*$",
+            r"^\s*#+\s*implementation explanation.*$",
+            r"^\s*#+\s*why this approach is used\s*$",
+            r"^\s*#+\s*relevant concepts.*$",
+            r"^\s*#+\s*alternative approach\s*$",
+            r"^\s*#+\s*cultural relevance\s*$",
+            r"^\s*#+\s*evidence from repository.*$",
+            r"^\s*direct answer\s*$",
+            r"^\s*implementation explanation.*$",
+            r"^\s*why this approach is used\s*$",
+            r"^\s*relevant concepts.*$",
+            r"^\s*alternative approach\s*$",
+            r"^\s*cultural relevance\s*$",
+            r"^\s*evidence from repository.*$",
+            r"^\s*note:\s*unsupported code entities.*$",
+        ]
+        blocked_heading_re = re.compile("|".join(blocked_heading_patterns), flags=re.IGNORECASE)
+
+        lines = text.splitlines()
+        kept: List[str] = []
+        skipping_evidence = False
+        for line in lines:
+            stripped = line.strip()
+            if re.match(r"^\s*#+\s*evidence from repository", stripped, flags=re.IGNORECASE):
+                skipping_evidence = True
+                continue
+            if skipping_evidence:
+                if not stripped:
+                    continue
+                if stripped.startswith("Snippet ") or stripped.startswith("- Snippet"):
+                    continue
+                if stripped.startswith("```"):
+                    continue
+                # Keep skipping rest of evidence block.
+                continue
+            if blocked_heading_re.match(stripped):
+                continue
+            kept.append(line)
+
+        compact = "\n".join(kept).strip()
+        if not compact:
+            return compact
+
+        # Remove noisy short numeric stubs like "1. shimmer", but keep real step-by-step answers.
+        filtered_lines: List[str] = []
+        for line in compact.splitlines():
+            stripped = line.strip()
+            numbered = re.match(r"^\d+\.\s+(.+)$", stripped)
+            if numbered:
+                body = numbered.group(1).strip()
+                token_count = len(re.findall(r"[A-Za-z0-9_/-]+", body))
+                if token_count <= 4 and not re.search(r"[.!?:]$", body):
+                    continue
+            filtered_lines.append(line)
+
+        return "\n".join(filtered_lines).strip()
 
     def _is_feature_overview_intent(self, intent: str) -> bool:
         """Return True for broad feature-overview questions."""

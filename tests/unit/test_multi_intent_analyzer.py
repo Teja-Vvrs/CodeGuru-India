@@ -64,3 +64,49 @@ def test_followup_explain_clause_merges_with_primary_subject():
     text = intents[0].intent_text.lower()
     assert "routing system" in text
     assert "explain" in text
+
+
+def test_understand_query_resolves_followup_with_chat_context():
+    analyzer = MultiIntentAnalyzer(_DummyOrchestrator())
+    history = [
+        {"role": "user", "content": "Explain authentication flow in this repository"},
+        {"role": "assistant", "content": "It starts in the router and auth guard."},
+    ]
+
+    understanding = analyzer.understand_query("and why we use that?", chat_history=history)
+
+    assert understanding.used_chat_context is True
+    assert "authentication" in understanding.normalized_query.lower()
+    assert understanding.intents
+    assert "authentication" in understanding.intents[0].intent_text.lower()
+
+
+def test_understand_query_extracts_response_profile():
+    analyzer = MultiIntentAnalyzer(_DummyOrchestrator())
+
+    understanding = analyzer.understand_query(
+        "explain routing in detail step by step with examples"
+    )
+    profile = understanding.response_profile
+
+    assert profile["depth"] == "deep"
+    assert profile["format"] == "steps"
+    assert profile["include_examples"] is True
+
+
+def test_understand_query_does_not_force_previous_topic_for_broad_new_prompt():
+    analyzer = MultiIntentAnalyzer(_DummyOrchestrator())
+    history = [
+        {"role": "user", "content": "Explain authentication flow in this repository"},
+        {"role": "assistant", "content": "It starts in login and auth middleware."},
+    ]
+
+    understanding = analyzer.understand_query(
+        "explain the flow of this dev tinder what is this about in a clear way",
+        chat_history=history,
+    )
+
+    assert understanding.used_chat_context is False
+    assert "dev tinder" in understanding.normalized_query.lower()
+    assert "authentication" not in understanding.normalized_query.lower()
+    assert understanding.intents

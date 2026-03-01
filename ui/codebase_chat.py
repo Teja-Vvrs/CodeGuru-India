@@ -8,7 +8,9 @@ import streamlit as st
 import logging
 import time
 import html
-from typing import List, Dict, Any
+import re
+import os
+from typing import List, Dict, Any, Optional
 from ui.design_system import section_header, spacing
 from utils.performance_metrics import record_metric
 
@@ -35,6 +37,27 @@ FEATURE_OVERVIEW_PATTERNS = (
     "capabilities",
     "overview",
 )
+BROAD_CONTEXT_TERMS = (
+    "codebase",
+    "repo",
+    "repository",
+    "project",
+    "application",
+    "app",
+    "system",
+)
+BROAD_OVERVIEW_CUES = (
+    "about",
+    "overview",
+    "summary",
+    "high level",
+    "big picture",
+    "purpose",
+    "what is",
+    "what does",
+    "tell me",
+    "explain",
+)
 LOCATION_PATTERNS = (
     "which file",
     "where is",
@@ -43,6 +66,9 @@ LOCATION_PATTERNS = (
     "defined in",
     "implemented in",
     "located",
+    "is there",
+    "exist",
+    "file exists",
 )
 COMPARISON_PATTERNS = (
     "compare",
@@ -62,6 +88,7 @@ DEBUG_PATTERNS = (
     "exception",
     "traceback",
 )
+CHAT_CONTEXT_MAX_TOPICS = 14
 
 
 def _audio_signature(audio_bytes: bytes) -> str:
@@ -80,44 +107,13 @@ def _contains_non_ascii(text: str) -> bool:
 
 def _grounding_failure_message(output_language: str, grounding: Dict[str, Any]) -> str:
     """Localized message when retrieval evidence is insufficient."""
-    reason = grounding.get("reason", "low_score")
-    anchors = grounding.get("anchor_terms", []) or []
-    anchor_note = ", ".join(f"`{term}`" for term in anchors[:4]) if anchors else ""
-
     if output_language == "hindi":
-        if reason == "missing_anchor" and anchor_note:
-            return (
-                "मुझे इस प्रश्न के लिए रिपॉजिटरी से पर्याप्त सटीक प्रमाण नहीं मिला।\n\n"
-                f"इन anchors का स्पष्ट match नहीं मिला: {anchor_note}\n"
-                "कृपया exact file/function/feature नाम के साथ फिर पूछें।"
-            )
-        return (
-            "मुझे इस प्रश्न के लिए रिपॉजिटरी के रिट्रीव्ड snippets में पर्याप्त प्रमाण नहीं मिला।\n\n"
-            "कृपया प्रश्न को थोड़ा specific करें (feature, file, function, route का नाम दें)।"
-        )
+        return "रिपॉजिटरी में संबंधित फाइल नहीं मिली।"
 
     if output_language == "telugu":
-        if reason == "missing_anchor" and anchor_note:
-            return (
-                "ఈ ప్రశ్నకు రిపోజిటరీలో తగిన స్పష్టమైన ఆధారాలు కనిపించలేదు.\n\n"
-                f"ఈ anchors కు match కాలేదు: {anchor_note}\n"
-                "దయచేసి exact file/function/feature పేరుతో మళ్లీ అడగండి."
-            )
-        return (
-            "ఈ ప్రశ్నకు రిట్రీవ్ చేసిన repository snippets‌లో సరిపడే ఆధారాలు లభించలేదు.\n\n"
-            "దయచేసి ప్రశ్నను మరింత specific గా అడగండి (feature/file/function/route పేరుతో)."
-        )
+        return "రిపోజిటరీలో సంబంధిత ఫైల్ దొరకలేదు."
 
-    if reason == "missing_anchor" and anchor_note:
-        return (
-            "I could not find strong repository evidence for this question.\n\n"
-            f"I could not match these query anchors: {anchor_note}\n"
-            "Please ask with exact file/function/feature names."
-        )
-    return (
-        "I could not find strong repository evidence for this question in retrieved snippets.\n\n"
-        "Please rephrase with a specific feature, file, function, or route name."
-    )
+    return "No relevant file found in repository."
 
 
 def _normalize_intent_for_search(intent_text: str, output_language: str, rag_explainer) -> str:
@@ -163,13 +159,30 @@ User question:
 def _is_feature_overview_query(text: str) -> bool:
     """Detect broad feature-overview questions."""
     query = (text or "").lower()
-    return any(pattern in query for pattern in FEATURE_OVERVIEW_PATTERNS)
+    if any(pattern in query for pattern in FEATURE_OVERVIEW_PATTERNS):
+        return True
+    return _looks_like_broad_overview_query(query)
+
+
+def _looks_like_broad_overview_query(query: str) -> bool:
+    """Generalized high-level query detector, not tied to exact user phrasing."""
+    has_context = any(term in query for term in BROAD_CONTEXT_TERMS)
+    has_overview_cue = any(term in query for term in BROAD_OVERVIEW_CUES)
+    has_file_like_ref = bool(
+        re.search(
+            r"[A-Za-z0-9_./-]+\.(?:jsx|tsx|py|js|ts|java|go|rb|php|cs|json|yaml|yml|toml)",
+            query,
+        )
+    )
+    return bool(has_context and has_overview_cue and not has_file_like_ref)
 
 
 def _classify_query_strategy(text: str) -> str:
     """Classify query to tune retrieval breadth."""
     query = (text or "").lower()
     if any(pattern in query for pattern in FEATURE_OVERVIEW_PATTERNS):
+        return "overview"
+    if _looks_like_broad_overview_query(query):
         return "overview"
     if any(pattern in query for pattern in COMPARISON_PATTERNS):
         return "comparison"
@@ -178,6 +191,25 @@ def _classify_query_strategy(text: str) -> str:
     if any(pattern in query for pattern in LOCATION_PATTERNS):
         return "location"
     return "specific"
+
+
+def _allow_soft_grounding(grounding: Dict[str, Any], relevant_chunks: List[Any]) -> bool:
+    """Allow low-score broad queries to proceed when we still have plausible evidence."""
+    if not relevant_chunks:
+        return False
+
+    mode = (grounding or {}).get("query_mode", "specific")
+    reason = (grounding or {}).get("reason", "ok")
+    top_score = float((grounding or {}).get("top_score") or 0.0)
+    anchor_terms = (grounding or {}).get("anchor_terms") or []
+
+    if mode in {"overview", "comparison", "config"} and reason in {"low_score", "missing_anchor"}:
+        return top_score >= 0.2
+
+    if mode == "specific" and not anchor_terms and reason == "low_score":
+        return top_score >= 0.25
+
+    return False
 
 
 def _top_k_for_query_strategy(strategy: str) -> int:
@@ -190,6 +222,220 @@ def _top_k_for_query_strategy(strategy: str) -> int:
         "specific": 20,
     }
     return mapping.get(strategy, 20)
+
+
+def _topic_tokens_from_text(text: str) -> List[str]:
+    """Extract reusable topic tokens from text for long-conversation memory."""
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_./:-]{2,}", (text or ""))
+    filtered = []
+    stop = {
+        "code", "codebase", "repo", "repository", "project", "app",
+        "what", "why", "how", "where", "which", "this", "that",
+        "explain", "tell", "show", "please",
+    }
+    for token in tokens:
+        normalized = token.strip("`'\".,:;()[]{}").lower()
+        if not normalized or len(normalized) <= 2:
+            continue
+        if normalized in stop:
+            continue
+        filtered.append(normalized)
+    return filtered
+
+
+def _is_elliptical_followup_for_context(query: str) -> bool:
+    """Use topic carry-over only for short, reference-heavy follow-up prompts."""
+    text = (query or "").strip().lower()
+    if not text:
+        return False
+
+    followup_prefixes = (
+        "and ",
+        "also ",
+        "then ",
+        "so ",
+        "what about",
+        "how about",
+        "why ",
+        "how ",
+        "where ",
+    )
+    followup_refs = {"this", "that", "it", "these", "those", "them", "same"}
+    low_signal = {
+        "what", "why", "how", "where", "which", "tell", "show", "explain",
+        "about", "repo", "repository", "codebase", "project", "app",
+        "flow", "overview", "summary",
+    }
+
+    tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_:-]*", text)
+    has_prefix = any(text.startswith(prefix) for prefix in followup_prefixes)
+    has_ref = any(token in followup_refs for token in tokens)
+    has_broad_cue = any(cue in text for cue in BROAD_OVERVIEW_CUES)
+
+    informative_tokens = [
+        token for token in tokens
+        if token not in followup_refs
+        and token not in BROAD_CONTEXT_TERMS
+        and token not in low_signal
+        and len(token) > 2
+    ]
+
+    if has_broad_cue and len(informative_tokens) >= 2:
+        return False
+    if has_prefix and len(informative_tokens) <= 6:
+        return True
+    if has_ref and len(tokens) <= 10 and len(informative_tokens) <= 2:
+        return True
+    return len(tokens) <= 4 and len(informative_tokens) == 0
+
+
+def _ensure_chat_context_store() -> Dict[str, Any]:
+    """Ensure session-level chat context storage exists."""
+    if "codebase_chat_context_state" not in st.session_state:
+        st.session_state.codebase_chat_context_state = {}
+    return st.session_state.codebase_chat_context_state
+
+
+def _get_chat_context_state(session_id: str) -> Dict[str, Any]:
+    """Get conversation context state for a memory session."""
+    store = _ensure_chat_context_store()
+    if session_id not in store:
+        store[session_id] = {
+            "topics": {},
+            "last_user_query": "",
+            "last_assistant_summary": "",
+            "turns": 0,
+        }
+    return store[session_id]
+
+
+def _active_topics(context_state: Dict[str, Any], limit: int = 5) -> List[str]:
+    topics = context_state.get("topics", {})
+    ranked = sorted(
+        topics.items(),
+        key=lambda item: (int(item[1].get("count", 0)), int(item[1].get("last_turn", 0))),
+        reverse=True,
+    )
+    return [name for name, _ in ranked[:max(1, limit)]]
+
+
+def _update_chat_context_state(
+    session_id: str,
+    user_query: str,
+    assistant_text: str,
+    code_references: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Update conversation topic memory with each completed turn."""
+    state = _get_chat_context_state(session_id)
+    state["turns"] = int(state.get("turns", 0)) + 1
+    turn = state["turns"]
+
+    candidates = []
+    candidates.extend(_topic_tokens_from_text(user_query))
+    candidates.extend(_topic_tokens_from_text(assistant_text[:800]))
+    for ref in code_references or []:
+        candidates.extend(_topic_tokens_from_text(str(ref.get("file", ""))))
+        candidates.extend(_topic_tokens_from_text(str(ref.get("lines", ""))))
+
+    topics = state.setdefault("topics", {})
+    for token in candidates:
+        entry = topics.setdefault(token, {"count": 0, "last_turn": 0})
+        entry["count"] = int(entry.get("count", 0)) + 1
+        entry["last_turn"] = turn
+
+    # Keep topic memory compact.
+    if len(topics) > CHAT_CONTEXT_MAX_TOPICS:
+        ranked = sorted(
+            topics.items(),
+            key=lambda item: (int(item[1].get("count", 0)), int(item[1].get("last_turn", 0))),
+            reverse=True,
+        )[:CHAT_CONTEXT_MAX_TOPICS]
+        state["topics"] = {name: meta for name, meta in ranked}
+
+    state["last_user_query"] = user_query
+    state["last_assistant_summary"] = (assistant_text or "")[:500]
+    return state
+
+
+def _build_clarification_message(
+    output_language: str,
+    suggested_focus: List[str],
+    active_topics: List[str],
+) -> str:
+    """Localized clarification prompt for ambiguous user questions."""
+    focus = ", ".join(suggested_focus[:4]) if suggested_focus else ""
+    recent = ", ".join(active_topics[:3]) if active_topics else ""
+
+    if output_language == "hindi":
+        if recent:
+            return (
+                f"आपका प्रश्न थोड़ा अस्पष्ट है। क्या आप बताना चाहेंगे कि किस हिस्से पर फोकस चाहिए: {focus}? "
+                f"हाल की बातचीत के आधार पर हम `{recent}` पर भी जा सकते हैं।"
+            )
+        return f"आपका प्रश्न थोड़ा अस्पष्ट है। कृपया फोकस बताएं: {focus}."
+
+    if output_language == "telugu":
+        if recent:
+            return (
+                f"మీ ప్రశ్న కొంచెం స్పష్టంగా లేదు. దయచేసి ఏ భాగం కావాలో చెప్పండి: {focus}. "
+                f"ఇటీవలి చర్చ ప్రకారం `{recent}` పై కూడా కొనసాగవచ్చు."
+            )
+        return f"మీ ప్రశ్న కొంచెం స్పష్టంగా లేదు. దయచేసి ఫోకస్ చెప్పండి: {focus}."
+
+    if recent:
+        return (
+            f"Your question is a bit ambiguous. Please pick a focus: {focus}. "
+            f"From recent context, we can also continue with `{recent}`."
+        )
+    return f"Your question is a bit ambiguous. Please pick a focus: {focus}."
+
+
+def _abspath_for_reference(repo_path: str, file_path: str) -> str:
+    """Resolve reference file path to absolute path when possible."""
+    if not file_path:
+        return ""
+    if os.path.isabs(file_path):
+        return file_path
+    return os.path.abspath(os.path.join(repo_path or "", file_path))
+
+
+def _enrich_code_references(
+    refs: List[Dict[str, Any]],
+    relevant_chunks: List[Any],
+    repo_path: str,
+) -> List[Dict[str, Any]]:
+    """Attach absolute path, score, and compact snippet to code references."""
+    chunk_map = {
+        (chunk.file_path, f"{chunk.start_line}-{chunk.end_line}"): chunk
+        for chunk in (relevant_chunks or [])
+    }
+    enriched: List[Dict[str, Any]] = []
+    seen = set()
+    for ref in refs or []:
+        file_path = str(ref.get("file", "")).strip()
+        lines = str(ref.get("lines", "")).strip()
+        key = (file_path, lines)
+        if not file_path or key in seen:
+            continue
+        seen.add(key)
+        chunk = chunk_map.get(key)
+        snippet = str(ref.get("content", "")).strip()
+        score = None
+        if chunk is not None:
+            snippet = (chunk.content or "").strip()[:420]
+            score = float(getattr(chunk, "relevance_score", 0.0) or 0.0)
+
+        enriched.append(
+            {
+                "file": file_path,
+                "abs_path": _abspath_for_reference(repo_path, file_path),
+                "lines": lines,
+                "content": snippet,
+                "score": score,
+            }
+        )
+    enriched.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return enriched
 
 
 def render_codebase_chat(
@@ -269,6 +515,12 @@ def render_codebase_chat(
         repo_path,
         output_language,
     )
+    context_key = analysis_session_id or "__default__"
+    context_state = _get_chat_context_state(context_key)
+    if memory_store and analysis_session_id and not context_state.get("topics"):
+        persisted_context = memory_store.get_artifact(analysis_session_id, "chat_context_state")
+        if isinstance(persisted_context, dict):
+            _ensure_chat_context_store()[context_key] = persisted_context
     
     # Check if semantic search is indexed
     if not hasattr(semantic_search, 'code_chunks') or not semantic_search.code_chunks:
@@ -554,6 +806,10 @@ def _process_query(
     start_time = time.perf_counter()
     try:
         st.session_state.chat_processing = True
+        previous_chat_history = list(st.session_state.chat_history)
+        context_key = analysis_session_id or "__default__"
+        context_state = _get_chat_context_state(context_key)
+        active_context_topics = _active_topics(context_state, limit=5)
         
         # Add user message
         st.session_state.chat_history.append({
@@ -572,7 +828,63 @@ def _process_query(
         with st.spinner("🤔 Analyzing your question..."):
             # Analyze intents
             logger.info(f"Analyzing query: {query}")
-            intents = multi_intent_analyzer.analyze_query(query)
+            response_profile = {"depth": "standard", "format": "narrative", "include_examples": False}
+            normalized_query = query
+            used_chat_context = False
+            if hasattr(multi_intent_analyzer, "understand_query"):
+                understanding = multi_intent_analyzer.understand_query(
+                    query,
+                    chat_history=previous_chat_history,
+                )
+                intents = understanding.intents
+                response_profile = understanding.response_profile or response_profile
+                normalized_query = understanding.normalized_query or query
+                used_chat_context = bool(understanding.used_chat_context)
+                if understanding.used_chat_context:
+                    logger.info(
+                        "Using previous chat context to resolve follow-up query: %s",
+                        understanding.normalized_query,
+                    )
+            else:
+                intents = multi_intent_analyzer.analyze_query(query)
+
+            clarity = {
+                "is_ambiguous": False,
+                "suggested_focus": [],
+                "reason": "clear",
+            }
+            if hasattr(semantic_search, "analyze_query_clarity"):
+                clarity = semantic_search.analyze_query_clarity(normalized_query)
+                logger.info(f"Query clarity: {clarity}")
+
+            if clarity.get("is_ambiguous") and not used_chat_context and not active_context_topics:
+                clarification = _build_clarification_message(
+                    output_language=output_language,
+                    suggested_focus=clarity.get("suggested_focus", []),
+                    active_topics=active_context_topics,
+                )
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": clarification,
+                    "code_references": [],
+                    "metadata": {
+                        "clarification_needed": True,
+                        "clarification_reason": clarity.get("reason", "low_specificity"),
+                    },
+                })
+                if memory_store and analysis_session_id:
+                    memory_store.save_chat_message(
+                        analysis_session_id,
+                        role="assistant",
+                        content=clarification,
+                        language=output_language,
+                        metadata={
+                            "clarification_needed": True,
+                            "clarification_reason": clarity.get("reason", "low_specificity"),
+                        },
+                    )
+                st.session_state.chat_processing = False
+                return
             logger.info(f"Found {len(intents)} intents")
         
         # Process each intent
@@ -581,15 +893,30 @@ def _process_query(
         for i, intent in enumerate(intents, 1):
             with st.spinner(f"🔍 Searching codebase for intent {i}/{len(intents)}..."):
                 # Search for relevant code
+                retrieval_intent = intent.intent_text
+                if hasattr(semantic_search, "analyze_query_clarity"):
+                    intent_clarity = semantic_search.analyze_query_clarity(retrieval_intent)
+                    if (
+                        intent_clarity.get("is_ambiguous")
+                        and active_context_topics
+                        and _is_elliptical_followup_for_context(retrieval_intent)
+                    ):
+                        retrieval_intent = (
+                            f"{retrieval_intent} context {' '.join(active_context_topics[:3])}"
+                        )
                 search_query = _normalize_intent_for_search(
-                    intent.intent_text,
+                    retrieval_intent,
                     output_language,
                     rag_explainer,
                 )
                 strategy = _classify_query_strategy(search_query)
                 if strategy == "specific":
-                    strategy = _classify_query_strategy(intent.intent_text)
+                    strategy = _classify_query_strategy(retrieval_intent)
                 top_k = _top_k_for_query_strategy(strategy)
+                if response_profile.get("depth") == "deep":
+                    top_k = min(top_k + 8, 48)
+                elif response_profile.get("depth") == "brief":
+                    top_k = max(12, top_k - 4)
                 logger.info(f"Searching for: {intent.intent_text}")
                 logger.info(f"Search query used for retrieval: {search_query}")
                 logger.info(f"Query strategy: {strategy} (top_k={top_k})")
@@ -610,7 +937,8 @@ def _process_query(
                     grounding = semantic_search.assess_grounding(intent.intent_text, relevant_chunks)
                     logger.info(f"Grounding assessment: {grounding}")
 
-                if not relevant_chunks or not grounding.get("is_grounded", False):
+                grounded = bool(grounding.get("is_grounded", False))
+                if not relevant_chunks or (not grounded and not _allow_soft_grounding(grounding, relevant_chunks)):
                     logger.warning(f"No relevant code found for: {intent.intent_text}")
                     responses.append({
                         'intent': intent.intent_text,
@@ -628,6 +956,12 @@ def _process_query(
                     repo_analysis,
                     use_web_search=False,  # Set to False for now
                     output_language=output_language,
+                    response_profile=response_profile,
+                )
+                explanation_result["code_references"] = _enrich_code_references(
+                    explanation_result.get("code_references", []),
+                    relevant_chunks,
+                    repo_path,
                 )
                 logger.info(f"Explanation generated: {len(explanation_result.get('explanation', ''))} chars")
                 
@@ -635,6 +969,13 @@ def _process_query(
         
         # Combine responses
         combined_response = _combine_responses(responses)
+
+        updated_context_state = _update_chat_context_state(
+            context_key,
+            user_query=query,
+            assistant_text=combined_response.get("explanation", ""),
+            code_references=combined_response.get("code_references", []),
+        )
         
         # Add assistant message
         st.session_state.chat_history.append({
@@ -643,6 +984,7 @@ def _process_query(
             'code_references': combined_response.get('code_references', []),
             'metadata': {
                 'intents_processed': len(intents),
+                'active_topics': _active_topics(updated_context_state, limit=4),
                 'files_analyzed': len(
                     set(
                         ref.get('file')
@@ -662,7 +1004,14 @@ def _process_query(
                 metadata={
                     "code_references": combined_response.get("code_references", []),
                     "intents_processed": len(intents),
+                    "active_topics": _active_topics(updated_context_state, limit=6),
                 },
+            )
+            memory_store.save_artifact(
+                analysis_session_id,
+                "chat_context_state",
+                updated_context_state,
+                replace=True,
             )
 
         record_metric(
@@ -752,10 +1101,28 @@ def _combine_responses(responses: List[Dict[str, Any]]) -> Dict[str, Any]:
         
         combined_explanation += response['explanation']
         all_code_refs.extend(response.get('code_references', []))
+
+    # Deduplicate citations and keep the highest score per file+line.
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for ref in all_code_refs:
+        file_path = str(ref.get("file", "")).strip()
+        lines = str(ref.get("lines", "")).strip()
+        key = f"{file_path}:{lines}"
+        if not file_path:
+            continue
+        current_score = float(ref.get("score") or 0.0)
+        existing = deduped.get(key)
+        if not existing or float(existing.get("score") or 0.0) < current_score:
+            deduped[key] = ref
+    merged_refs = sorted(
+        deduped.values(),
+        key=lambda item: float(item.get("score") or 0.0),
+        reverse=True,
+    )
     
     return {
         'explanation': combined_explanation,
-        'code_references': all_code_refs
+        'code_references': merged_refs
     }
 
 
@@ -792,15 +1159,39 @@ def _render_message(message: Dict[str, Any]):
         # Show code references
         code_refs = message.get('code_references', [])
         if code_refs:
+            repo_context = st.session_state.session_manager.get_current_repository() if "session_manager" in st.session_state else {}
+            repo_path = repo_context.get("repo_path", "") if isinstance(repo_context, dict) else ""
             with st.expander(f"📁 Code References ({len(code_refs)} files)"):
-                for ref in code_refs[:5]:  # Show top 5
-                    st.markdown(f"**{ref['file']}** (lines {ref['lines']})")
-                    if 'content' in ref:
-                        st.code(ref['content'][:300] + "..." if len(ref['content']) > 300 else ref['content'])
+                for idx, ref in enumerate(code_refs[:8], start=1):  # Show top references
+                    file_path = ref.get("file", "")
+                    lines = ref.get("lines", "")
+                    abs_path = ref.get("abs_path") or _abspath_for_reference(repo_path, file_path)
+                    line_value = ""
+                    if lines and "-" in str(lines):
+                        line_value = str(lines).split("-")[0]
+                    elif lines:
+                        line_value = str(lines)
+                    link_target = f"file://{abs_path}"
+                    if line_value.isdigit():
+                        link_target = f"{link_target}#L{line_value}"
+                    score = ref.get("score")
+                    score_text = f" · relevance {float(score):.2f}" if score is not None else ""
+                    st.markdown(
+                        f"{idx}. [`{file_path}:{lines}`]({link_target}){score_text}"
+                    )
+                    snippet = str(ref.get("content", "") or "").strip()
+                    if snippet:
+                        st.code(
+                            snippet[:360] + "..." if len(snippet) > 360 else snippet,
+                            language="text",
+                        )
         
         # Show metadata
         metadata = message.get('metadata', {})
         if metadata:
             st.caption(f"✓ Analyzed {metadata.get('files_analyzed', 0)} files | Processed {metadata.get('intents_processed', 1)} intent(s)")
+            topics = metadata.get("active_topics") or []
+            if topics:
+                st.caption(f"Context topics: {', '.join(topics[:4])}")
         
         spacing("sm")

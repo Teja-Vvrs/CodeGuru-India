@@ -6,7 +6,7 @@ This module can parse and analyze queries with multiple learning goals.
 
 import logging
 import re
-from typing import List
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -19,6 +19,15 @@ class Intent:
     intent_type: str  # 'how', 'what', 'why', 'where', 'explain', 'show'
     keywords: List[str]
     priority: int  # 1 (high) to 3 (low)
+
+
+@dataclass
+class QueryUnderstanding:
+    """Structured understanding for one user turn."""
+    normalized_query: str
+    intents: List[Intent]
+    response_profile: Dict[str, Any]
+    used_chat_context: bool = False
 
 
 class MultiIntentAnalyzer:
@@ -45,6 +54,47 @@ class MultiIntentAnalyzer:
         "have", "has", "had", "do", "does", "did", "are", "is", "was", "were",
         "me", "my", "our", "your", "their", "there", "here",
     }
+    FOLLOWUP_PREFIXES = (
+        "and ",
+        "also ",
+        "then ",
+        "so ",
+        "what about",
+        "how about",
+        "why",
+        "how",
+        "where",
+    )
+    FOLLOWUP_REFERENCES = {
+        "that", "it", "this", "these", "those", "them", "same",
+    }
+    BROAD_OVERVIEW_CUES = (
+        "about",
+        "overview",
+        "summary",
+        "flow",
+        "architecture",
+        "high level",
+        "big picture",
+        "end to end",
+        "purpose",
+    )
+    DEPTH_CUES = {
+        "brief": ("brief", "short", "quick", "tldr", "one line", "in short"),
+        "deep": ("detailed", "detail", "deep", "in depth", "thorough", "step by step", "comprehensive"),
+    }
+    FORMAT_CUES = {
+        "steps": ("step by step", "steps", "walkthrough"),
+        "bullets": ("bullet", "list", "points"),
+    }
+    EXAMPLE_CUES = (
+        "example",
+        "examples",
+        "sample",
+        "use case",
+        "real world",
+        "snippet",
+    )
     
     def __init__(self, langchain_orchestrator):
         """
@@ -87,6 +137,35 @@ class MultiIntentAnalyzer:
         except Exception as e:
             logger.error(f"Intent analysis failed: {e}")
             return [self._build_single_intent(user_query)]
+
+    def understand_query(
+        self,
+        user_query: str,
+        chat_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> QueryUnderstanding:
+        """
+        Build a generalized understanding of the user turn.
+        Includes follow-up resolution and response-style preferences.
+        """
+        cleaned_query = self._strip_conversational_prefix(self._normalize_text(user_query))
+        resolved_query = cleaned_query
+        used_context = False
+
+        if self._is_followup_query(cleaned_query):
+            previous_user_query = self._latest_user_query(chat_history or [])
+            if previous_user_query:
+                resolved_query = self._resolve_followup_with_previous(cleaned_query, previous_user_query)
+                used_context = (resolved_query != cleaned_query)
+
+        intents = self.analyze_query(resolved_query)
+        response_profile = self._detect_response_profile(cleaned_query)
+
+        return QueryUnderstanding(
+            normalized_query=resolved_query,
+            intents=intents,
+            response_profile=response_profile,
+            used_chat_context=used_context,
+        )
     
     def _extract_intents_with_ai(self, query: str) -> List[Intent]:
         """
@@ -421,3 +500,107 @@ Extract all intents:"""
         keywords = [w.strip('.,!?;:()[]{}') for w in words if w.lower() not in stop_words and len(w) > 2]
 
         return keywords
+
+    def _is_followup_query(self, query: str) -> bool:
+        """Detect likely follow-up turns that depend on previous context."""
+        query_lower = self._normalize_text(query).lower()
+        if not query_lower:
+            return False
+
+        tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_:-]*", query_lower)
+        has_followup_prefix = any(query_lower.startswith(prefix) for prefix in self.FOLLOWUP_PREFIXES)
+        has_reference_token = any(token in self.FOLLOWUP_REFERENCES for token in tokens)
+
+        informative_tokens = [
+            token for token in tokens
+            if token not in self.FOLLOWUP_REFERENCES
+            and token not in self.CONTEXT_WORDS
+            and token not in self.SUBJECT_STOP_WORDS
+            and token not in self.QUESTION_STARTERS
+            and len(token) > 2
+        ]
+
+        # Do not treat broad, self-contained prompts as follow-ups even if they contain "this/that".
+        if self._is_self_contained_overview_query(query_lower, informative_tokens):
+            return False
+
+        if has_followup_prefix and len(informative_tokens) <= 6:
+            return True
+
+        if has_reference_token and len(tokens) <= 10 and len(informative_tokens) <= 2:
+            return True
+
+        # Very short prompts are frequently elliptical follow-ups.
+        return len(tokens) <= 4 and len(informative_tokens) == 0
+
+    def _is_self_contained_overview_query(self, query: str, informative_tokens: List[str]) -> bool:
+        """True when query is a fresh broad request, not an elliptical follow-up."""
+        if not query:
+            return False
+        has_overview_cue = any(cue in query for cue in self.BROAD_OVERVIEW_CUES)
+        if not has_overview_cue:
+            return False
+        return len(informative_tokens) >= 2
+
+    def _latest_user_query(self, chat_history: List[Dict[str, Any]]) -> str:
+        """Get latest user turn text from chat history."""
+        for message in reversed(chat_history):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") != "user":
+                continue
+            content = self._normalize_text(str(message.get("content", "")))
+            if content:
+                return content
+        return ""
+
+    def _resolve_followup_with_previous(self, followup_query: str, previous_query: str) -> str:
+        """Resolve follow-up references by reusing previous query subject."""
+        followup = self._normalize_text(followup_query)
+        previous = self._normalize_text(previous_query)
+        if not followup or not previous:
+            return followup
+
+        subject = self._extract_primary_subject(previous)
+        resolved = followup
+        if subject and re.search(r"\b(that|it|this|these|those|them|same)\b", resolved, flags=re.IGNORECASE):
+            resolved = re.sub(
+                r"\b(that|it|this|these|those|them|same)\b",
+                subject,
+                resolved,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+        # If still short and connective, append to previous to preserve intent context.
+        token_count = len(re.findall(r"[a-zA-Z_][a-zA-Z0-9_:-]*", resolved))
+        if token_count <= 7 and any(resolved.lower().startswith(prefix) for prefix in self.FOLLOWUP_PREFIXES):
+            suffix = re.sub(r"^(and|also|then|so)\s+", "", resolved, flags=re.IGNORECASE)
+            merged = f"{previous} and {suffix}"
+            return self._normalize_text(merged)
+
+        return self._normalize_text(resolved)
+
+    def _detect_response_profile(self, query: str) -> Dict[str, Any]:
+        """Infer response style preferences from user wording."""
+        query_lower = self._normalize_text(query).lower()
+
+        depth = "standard"
+        if any(cue in query_lower for cue in self.DEPTH_CUES["brief"]):
+            depth = "brief"
+        if any(cue in query_lower for cue in self.DEPTH_CUES["deep"]):
+            depth = "deep"
+
+        fmt = "narrative"
+        if any(cue in query_lower for cue in self.FORMAT_CUES["steps"]):
+            fmt = "steps"
+        elif any(cue in query_lower for cue in self.FORMAT_CUES["bullets"]):
+            fmt = "bullets"
+
+        include_examples = any(cue in query_lower for cue in self.EXAMPLE_CUES)
+
+        return {
+            "depth": depth,
+            "format": fmt,
+            "include_examples": include_examples,
+        }
