@@ -21,28 +21,6 @@ def render_sidebar() -> str:
             unsafe_allow_html=True,
         )
 
-        language_options = ["English", "हिंदी (Hindi)", "తెలుగు (Telugu)"]
-        language_map = {
-            "English": "english",
-            "हिंदी (Hindi)": "hindi",
-            "తెలుగు (Telugu)": "telugu",
-        }
-        reverse_language_map = {value: key for key, value in language_map.items()}
-        current_lang_key = st.session_state.get("selected_language", "english")
-        default_label = reverse_language_map.get(current_lang_key, "English")
-
-        st.markdown('<div class="cg-nav-caption">Language</div>', unsafe_allow_html=True)
-        selected_language_label = st.selectbox(
-            "Language",
-            options=language_options,
-            index=language_options.index(default_label) if default_label in language_options else 0,
-            label_visibility="collapsed",
-            key="sidebar_language_selector",
-        )
-        st.session_state.selected_language = language_map.get(selected_language_label, "english")
-        if "session_manager" in st.session_state:
-            st.session_state.session_manager.set_language_preference(st.session_state.selected_language)
-
         st.markdown('<div class="cg-nav-caption">Navigation</div>', unsafe_allow_html=True)
         pages = [
             "Home",

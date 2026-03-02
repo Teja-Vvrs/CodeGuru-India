@@ -7,6 +7,179 @@ from ai.prompt_templates import PromptManager
 from ai.langchain_orchestrator import LangChainOrchestrator
 from analyzers.code_analyzer import CodeAnalyzer
 
+# Module-level cache for session-specific services
+# This avoids storing non-serializable objects in st.session_state
+_session_services_cache = {}
+
+
+@st.cache_resource
+def get_backend_services():
+    """
+    Initialize and cache backend services.
+    
+    Uses @st.cache_resource to avoid serialization issues and improve performance.
+    These objects are cached globally and reused across sessions.
+    """
+    try:
+        # Load configuration
+        aws_config, app_config = load_config()
+        
+        # Initialize AI services
+        bedrock_client = BedrockClient(aws_config)
+        prompt_manager = PromptManager()
+        orchestrator = LangChainOrchestrator(bedrock_client, prompt_manager)
+        
+        from ai.voice_processor import VoiceProcessor
+        voice_processor = VoiceProcessor(aws_config)
+        
+        # Initialize analyzers and engines
+        code_analyzer = CodeAnalyzer(orchestrator)
+        
+        from engines.explanation_engine import ExplanationEngine
+        from engines.quiz_engine import QuizEngine
+        from generators.diagram_generator import DiagramGenerator
+        from learning.path_manager import LearningPathManager
+        from analyzers.repo_analyzer import RepoAnalyzer
+        
+        explanation_engine = ExplanationEngine(orchestrator)
+        quiz_engine = QuizEngine(orchestrator)
+        diagram_generator = DiagramGenerator()
+        path_manager = LearningPathManager()
+        repo_analyzer = RepoAnalyzer(code_analyzer)
+        
+        # Initialize intent-driven analysis components
+        from analyzers.intent_interpreter import IntentInterpreter
+        from analyzers.file_selector import FileSelector
+        from analyzers.multi_file_analyzer import MultiFileAnalyzer
+        from analyzers.repository_manager import RepositoryManager
+        
+        # Initialize new AI-powered components
+        from analyzers.semantic_code_search import SemanticCodeSearch
+        from analyzers.multi_intent_analyzer import MultiIntentAnalyzer
+        from analyzers.rag_explainer import RAGExplainer
+        from storage.memory_store import MemoryStore
+        from storage.session_memory_store import SessionMemoryStore
+        from generators.chat_learning_generator import ChatLearningGenerator
+        
+        intent_interpreter = IntentInterpreter(orchestrator)
+        file_selector = FileSelector(orchestrator)
+        multi_file_analyzer = MultiFileAnalyzer(code_analyzer, orchestrator)
+        repository_manager = RepositoryManager(repo_analyzer, max_size_mb=100)
+        
+        # Note: These need session_manager which is session-specific, so we'll initialize them separately
+        semantic_search = SemanticCodeSearch(orchestrator)
+        multi_intent_analyzer = MultiIntentAnalyzer(orchestrator)
+        rag_explainer = RAGExplainer(orchestrator, web_search_available=False)
+        
+        if app_config.memory_backend == "sqlite":
+            memory_store = MemoryStore()
+            memory_backend = "sqlite"
+        else:
+            memory_store = SessionMemoryStore()
+            memory_backend = "session"
+        
+        chat_learning_generator = ChatLearningGenerator(orchestrator)
+        
+        return {
+            'bedrock_client': bedrock_client,
+            'prompt_manager': prompt_manager,
+            'orchestrator': orchestrator,
+            'voice_processor': voice_processor,
+            'code_analyzer': code_analyzer,
+            'explanation_engine': explanation_engine,
+            'quiz_engine': quiz_engine,
+            'diagram_generator': diagram_generator,
+            'path_manager': path_manager,
+            'repo_analyzer': repo_analyzer,
+            'intent_interpreter': intent_interpreter,
+            'file_selector': file_selector,
+            'multi_file_analyzer': multi_file_analyzer,
+            'repository_manager': repository_manager,
+            'semantic_search': semantic_search,
+            'multi_intent_analyzer': multi_intent_analyzer,
+            'rag_explainer': rag_explainer,
+            'memory_store': memory_store,
+            'memory_backend': memory_backend,
+            'chat_learning_generator': chat_learning_generator,
+            'app_config': app_config,
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def get_service(service_name: str):
+    """
+    Helper function to get a cached service by name.
+    
+    Args:
+        service_name: Name of the service to retrieve
+        
+    Returns:
+        The requested service or None if not found
+    """
+    services = get_backend_services()
+    return services.get(service_name)
+
+
+def get_session_specific_services():
+    """
+    Get or create session-specific services that depend on session_manager.
+    
+    These services are created per-session and stored in a way that avoids
+    serialization issues.
+    
+    Returns:
+        Dictionary of session-specific services
+    """
+    # Use a simple flag to track if we've initialized session services
+    if 'session_services_initialized' not in st.session_state:
+        from learning.progress_tracker import ProgressTracker
+        from learning.flashcard_manager import FlashcardManager
+        from learning.traceability_manager import TraceabilityManager
+        from generators.learning_artifact_generator import LearningArtifactGenerator
+        from analyzers.intent_driven_orchestrator import IntentDrivenOrchestrator
+        
+        services = get_backend_services()
+        
+        # Create session-specific instances
+        progress_tracker = ProgressTracker(st.session_state.session_manager)
+        flashcard_manager = FlashcardManager(st.session_state.session_manager)
+        traceability_manager = TraceabilityManager(st.session_state.session_manager)
+        
+        learning_artifact_generator = LearningArtifactGenerator(
+            flashcard_manager,
+            services['quiz_engine'],
+            services['orchestrator']
+        )
+        
+        intent_driven_orchestrator = IntentDrivenOrchestrator(
+            services['repository_manager'],
+            services['intent_interpreter'],
+            services['file_selector'],
+            services['multi_file_analyzer'],
+            learning_artifact_generator,
+            traceability_manager,
+            st.session_state.session_manager
+        )
+        
+        # Store in a module-level cache keyed by session
+        # This avoids storing in st.session_state
+        session_id = id(st.session_state.session_manager)
+        _session_services_cache[session_id] = {
+            'progress_tracker': progress_tracker,
+            'flashcard_manager': flashcard_manager,
+            'traceability_manager': traceability_manager,
+            'learning_artifact_generator': learning_artifact_generator,
+            'intent_driven_orchestrator': intent_driven_orchestrator,
+        }
+        
+        st.session_state.session_services_initialized = True
+        st.session_state._session_id = session_id
+    
+    # Retrieve from cache
+    session_id = st.session_state.get('_session_id')
+    return _session_services_cache.get(session_id, {})
+
 
 def main():
     """Initialize and run the Streamlit application."""
@@ -75,119 +248,21 @@ def initialize_session_state():
 
 
 def initialize_backend_services():
-    """Initialize AI and analysis services."""
+    """Initialize AI and analysis services using cached resources."""
     if "backend_initialized" not in st.session_state:
+        # Get cached backend services (this validates they can be created)
+        services = get_backend_services()
+        
+        if 'error' in services:
+            st.session_state.backend_initialized = False
+            st.session_state.backend_error = services['error']
+            return
+        
         try:
-            # Load configuration
-            aws_config, app_config = load_config()
-            
-            # Initialize AI services
-            bedrock_client = BedrockClient(aws_config)
-            prompt_manager = PromptManager()
-            orchestrator = LangChainOrchestrator(bedrock_client, prompt_manager)
-            
-            from ai.voice_processor import VoiceProcessor
-            voice_processor = VoiceProcessor(aws_config)
-            
-            # Initialize analyzers and engines
-            code_analyzer = CodeAnalyzer(orchestrator)
-            
-            from engines.explanation_engine import ExplanationEngine
-            from engines.quiz_engine import QuizEngine
-            from generators.diagram_generator import DiagramGenerator
-            from learning.path_manager import LearningPathManager
-            from learning.progress_tracker import ProgressTracker
-            from learning.flashcard_manager import FlashcardManager
-            from analyzers.repo_analyzer import RepoAnalyzer
-            
-            explanation_engine = ExplanationEngine(orchestrator)
-            quiz_engine = QuizEngine(orchestrator)
-            diagram_generator = DiagramGenerator()
-            path_manager = LearningPathManager()
-            progress_tracker = ProgressTracker(st.session_state.session_manager)
-            flashcard_manager = FlashcardManager(st.session_state.session_manager)
-            repo_analyzer = RepoAnalyzer(code_analyzer)
-            
-            # Initialize intent-driven analysis components
-            from analyzers.intent_interpreter import IntentInterpreter
-            from analyzers.file_selector import FileSelector
-            from analyzers.multi_file_analyzer import MultiFileAnalyzer
-            from analyzers.repository_manager import RepositoryManager
-            from generators.learning_artifact_generator import LearningArtifactGenerator
-            from learning.traceability_manager import TraceabilityManager
-            from analyzers.intent_driven_orchestrator import IntentDrivenOrchestrator
-            
-            # Initialize new AI-powered components
-            from analyzers.semantic_code_search import SemanticCodeSearch
-            from analyzers.multi_intent_analyzer import MultiIntentAnalyzer
-            from analyzers.rag_explainer import RAGExplainer
-            from storage.memory_store import MemoryStore
-            from storage.session_memory_store import SessionMemoryStore
-            from generators.chat_learning_generator import ChatLearningGenerator
-            
-            intent_interpreter = IntentInterpreter(orchestrator)
-            file_selector = FileSelector(orchestrator)
-            multi_file_analyzer = MultiFileAnalyzer(code_analyzer, orchestrator)
-            repository_manager = RepositoryManager(repo_analyzer, max_size_mb=100)
-            learning_artifact_generator = LearningArtifactGenerator(
-                flashcard_manager,
-                quiz_engine,
-                orchestrator
-            )
-            traceability_manager = TraceabilityManager(st.session_state.session_manager)
-            intent_driven_orchestrator = IntentDrivenOrchestrator(
-                repository_manager,
-                intent_interpreter,
-                file_selector,
-                multi_file_analyzer,
-                learning_artifact_generator,
-                traceability_manager,
-                st.session_state.session_manager
-            )
-            
-            # Initialize AI-powered search and explanation
-            semantic_search = SemanticCodeSearch(orchestrator)
-            multi_intent_analyzer = MultiIntentAnalyzer(orchestrator)
-            rag_explainer = RAGExplainer(orchestrator, web_search_available=False)
-            if app_config.memory_backend == "sqlite":
-                memory_store = MemoryStore()
-                memory_backend = "sqlite"
-            else:
-                memory_store = SessionMemoryStore()
-                memory_backend = "session"
-            chat_learning_generator = ChatLearningGenerator(orchestrator)
-            
-            # Store in session state
-            st.session_state.bedrock_client = bedrock_client
-            st.session_state.prompt_manager = prompt_manager
-            st.session_state.orchestrator = orchestrator
-            st.session_state.voice_processor = voice_processor
-            st.session_state.code_analyzer = code_analyzer
-            st.session_state.explanation_engine = explanation_engine
-            st.session_state.quiz_engine = quiz_engine
-            st.session_state.diagram_generator = diagram_generator
-            st.session_state.path_manager = path_manager
-            st.session_state.progress_tracker = progress_tracker
-            st.session_state.flashcard_manager = flashcard_manager
-            st.session_state.repo_analyzer = repo_analyzer
-            
-            # Intent-driven analysis components
-            st.session_state.intent_interpreter = intent_interpreter
-            st.session_state.file_selector = file_selector
-            st.session_state.multi_file_analyzer = multi_file_analyzer
-            st.session_state.repository_manager = repository_manager
-            st.session_state.learning_artifact_generator = learning_artifact_generator
-            st.session_state.traceability_manager = traceability_manager
-            st.session_state.intent_driven_orchestrator = intent_driven_orchestrator
-            
-            # AI-powered search and explanation
-            st.session_state.semantic_search = semantic_search
-            st.session_state.multi_intent_analyzer = multi_intent_analyzer
-            st.session_state.rag_explainer = rag_explainer
-            st.session_state.memory_store = memory_store
-            st.session_state.memory_backend = memory_backend
-            st.session_state.chat_learning_generator = chat_learning_generator
-            
+            # Don't store any service objects in session_state
+            # They will be accessed via get_backend_services() or get_service()
+            # Only store simple flags and data
+            st.session_state.memory_backend = services['memory_backend']
             st.session_state.backend_initialized = True
             
         except Exception as e:
@@ -298,36 +373,55 @@ def route_to_page(page: str):
     elif page == "Upload Code":
         # Use unified code analysis interface
         from ui.unified_code_analysis import render_unified_code_analysis
+        
+        # Get services from cache
+        services = get_backend_services()
+        session_services = get_session_specific_services()
+        
         render_unified_code_analysis(
-            st.session_state.intent_driven_orchestrator,
-            st.session_state.repository_manager,
-            st.session_state.intent_interpreter,
+            session_services['intent_driven_orchestrator'],
+            services['repository_manager'],
+            services['intent_interpreter'],
             st.session_state.session_manager,
-            st.session_state.code_analyzer,
-            st.session_state.flashcard_manager,
+            services['code_analyzer'],
+            session_services['flashcard_manager'],
         )
+    
     elif page == "Codebase Chat":
         from ui.codebase_chat import render_codebase_chat
+        
+        # Get services from cache
+        services = get_backend_services()
+        
         render_codebase_chat(
             st.session_state.session_manager,
-            st.session_state.semantic_search,
-            st.session_state.rag_explainer,
-            st.session_state.multi_intent_analyzer,
-            st.session_state.get("memory_store"),
+            services['semantic_search'],
+            services['rag_explainer'],
+            services['multi_intent_analyzer'],
+            services.get("memory_store"),
         )
+    
     elif page == "Learning Memory":
         from ui.learning_memory import render_learning_memory
+        
+        # Get services from cache
+        services = get_backend_services()
+        
         render_learning_memory(
             st.session_state.session_manager,
-            st.session_state.get("memory_store"),
-            st.session_state.get("chat_learning_generator"),
+            services.get("memory_store"),
+            services.get("chat_learning_generator"),
         )
+    
     elif page == "Explanations":
         render_explanation_view()
+    
     elif page == "Learning Paths":
         render_learning_path()
+    
     elif page == "Progress":
         render_progress_dashboard()
+    
     else:
         st.session_state.current_page = "Home"
         st.rerun()
